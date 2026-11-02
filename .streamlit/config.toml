@@ -1,6 +1,11 @@
 [theme]
 primaryColor = "#e9a3b2"
-backgroundColor = "#fff9fa"
-secondaryBackgroundColor = "#eff7ef"
-textColor = "#333333"
-font = "sans serif"
+backgroundColor = "#fffaf0"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#222222"
+font = "Jua, Malgun Gothic, sans-serif"
+
+[theme.sidebar]
+backgroundColor = "#ffffff"
+textColor = "#222222"
+font = "Jua, Malgun Gothic, sans-serif"
