@@ -1,0 +1,913 @@
+diff --git a/app/api/data/route.ts b/app/api/data/route.ts
+index a568c38..a362c3c 100644
+--- a/app/api/data/route.ts
++++ b/app/api/data/route.ts
+@@ -1,12 +1,13 @@
+ import { env } from "cloudflare:workers";
+ import { getAppUser, validOrigin, verifyPassword, clearSessionCookie, throttle } from "../../auth-session";
++import { validDate, scheduleValues, sharedSchedule } from "../../schedule-rules";
+ 
+ export const dynamic = "force-dynamic";
+ 
+ type Input = Record<string, unknown>;
+ const bad = (message: string, status = 400) => Response.json({ error: message }, { status });
+ const str = (value: unknown) => typeof value === "string" ? value.trim() : "";
+-const date = (value: unknown) => /^\d{4}-\d{2}-\d{2}$/.test(str(value)) && !Number.isNaN(Date.parse(`${str(value)}T00:00:00Z`)) ? str(value) : "";
++const date = validDate;
+ const choice = (value: unknown, allowed: string[], fallback: string) => allowed.includes(str(value)) ? str(value) : fallback;
+ 
+ async function rows(sql: string, ...args: unknown[]) {
+@@ -40,7 +41,7 @@ export async function GET() {
+   const feedTaskReactions = feedTaskIds.length ? await rows(`SELECT * FROM task_reactions WHERE task_id IN (${feedTaskIds.map(() => "?").join(",")})`, ...feedTaskIds) : [];
+   const feedDiaryReactions = feedDiaryIds.length ? await rows(`SELECT * FROM diary_reactions WHERE diary_id IN (${feedDiaryIds.map(() => "?").join(",")})`, ...feedDiaryIds) : [];
+   const feedComments = feedDiaryIds.length ? await rows(`SELECT dc.*, p.name FROM diary_comments dc JOIN profiles p ON p.id = dc.user_id WHERE diary_id IN (${feedDiaryIds.map(() => "?").join(",")}) ORDER BY dc.created_at`, ...feedDiaryIds) : [];
+-  return Response.json({ me, tasks, habits, checks, diaries, taskReactions, diaryReactions, comments, sharedTasks, sharedDiaries, feedTaskReactions, feedDiaryReactions, feedComments }, { headers: { "Cache-Control": "no-store" } });
++  return Response.json({ capabilities: ["schedule-v1"], me, tasks, habits, checks, diaries, taskReactions, diaryReactions, comments, sharedTasks: sharedTasks.map(sharedSchedule), sharedDiaries, feedTaskReactions, feedDiaryReactions, feedComments }, { headers: { "Cache-Control": "no-store" } });
+ }
+ 
+ export async function POST(request: Request) {
+@@ -62,16 +63,37 @@ export async function POST(request: Request) {
+   if (action === "task.add") {
+     const title = str(data.title).slice(0, 160), when = date(data.date);
+     if (!title || !when) return bad("할 일과 날짜를 입력해 주세요.");
+-    await env.DB!.prepare("INSERT INTO tasks (id, owner_id, date, title, status, visibility, created_at) VALUES (?, ?, ?, ?, 'todo', ?, ?)")
+-      .bind(crypto.randomUUID(), uid, when, title, choice(data.visibility, ["private", "shared"], "private"), now).run();
++    let schedule;
++    try { schedule = scheduleValues(data); } catch (e) { return bad((e as Error).message); }
++    await env.DB!.prepare("INSERT INTO tasks (id, owner_id, date, title, status, visibility, created_at, time_band, planned_start, planned_end, actual_start, actual_end, is_fixed, share_time, note) VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
++      .bind(crypto.randomUUID(), uid, when, title, choice(data.visibility, ["private", "shared"], "private"), now, schedule.time_band, schedule.planned_start, schedule.planned_end, schedule.actual_start, schedule.actual_end, schedule.is_fixed, schedule.share_time, schedule.note).run();
+   } else if (action === "task.update") {
+     if (!await own("tasks")) return bad("할 일을 찾을 수 없습니다.", 404);
++    const current = (await rows("SELECT * FROM tasks WHERE id = ? AND owner_id = ?", id, uid))[0];
++    let schedule;
++    try { schedule = scheduleValues(data, current); } catch (e) { return bad((e as Error).message); }
+     const fields: string[] = [], values: unknown[] = [];
++    for (const [column, value] of Object.entries(schedule)) { fields.push(`${column} = ?`); values.push(value); }
+     if (data.title !== undefined) { const title = str(data.title).slice(0, 160); if (!title) return bad("할 일을 입력해 주세요."); fields.push("title = ?"); values.push(title); }
+     if (data.date !== undefined) { const when = date(data.date); if (!when) return bad("날짜를 확인해 주세요."); fields.push("date = ?"); values.push(when); }
+-    if (data.status !== undefined) { fields.push("status = ?"); values.push(choice(data.status, ["todo", "done", "missed"], "todo")); }
++    if (data.status !== undefined) {
++      if (!["todo", "done", "missed", "partial", "skipped"].includes(str(data.status))) return bad("진행 상태를 확인해 주세요.");
++      fields.push("status = ?"); values.push(data.status);
++    }
+     if (data.visibility !== undefined) { fields.push("visibility = ?"); values.push(choice(data.visibility, ["private", "shared"], "private")); }
+     if (fields.length) await env.DB!.prepare(`UPDATE tasks SET ${fields.join(", ")} WHERE id = ? AND owner_id = ?`).bind(...values, id, uid).run();
++  } else if (action === "task.reschedule") {
++    const when = date(data.date), from = date(data.fromDate);
++    if (!when || !from || when === from) return bad("옮길 날짜를 확인해 주세요.");
++    if (!Array.isArray(data.ids) || !data.ids.length || data.ids.length > 100 || !data.ids.every(x => typeof x === "string" && x.length > 0 && x.length <= 100)) return bad("옮길 일정을 선택해 주세요.");
++    const ids = [...new Set(data.ids as string[])];
++    const slots = ids.map(() => "?").join(",");
++    // A single UPDATE is atomic. Recheck every item in the same statement so
++    // another session cannot silently turn an appointment into a moved task.
++    const condition = `owner_id = ? AND date = ? AND status = 'todo' AND is_fixed = 0 AND actual_start = '' AND id IN (${slots})`;
++    const result = await env.DB!.prepare(`UPDATE tasks SET date = ? WHERE ${condition} AND (SELECT COUNT(*) FROM tasks WHERE ${condition}) = ?`)
++      .bind(when, uid, from, ...ids, uid, from, ...ids, ids.length).run();
++    if (result.meta.changes !== ids.length) return bad("일정이 바뀌었어요. 새로 불러온 뒤 다시 선택해 주세요.", 409);
+   } else if (action === "task.delete") {
+     if (!await own("tasks")) return bad("할 일을 찾을 수 없습니다.", 404);
+     await env.DB!.prepare("DELETE FROM tasks WHERE id = ? AND owner_id = ?").bind(id, uid).run();
+diff --git a/db/schema.ts b/db/schema.ts
+index 04d6527..df1d192 100644
+--- a/db/schema.ts
++++ b/db/schema.ts
+@@ -32,6 +32,14 @@ export const tasks = sqliteTable("tasks", {
+   date: text("date").notNull(),
+   title: text("title").notNull(),
+   status: text("status").notNull().default("todo"),
++  timeBand: text("time_band").notNull().default("anytime"),
++  plannedStart: text("planned_start").notNull().default(""),
++  plannedEnd: text("planned_end").notNull().default(""),
++  actualStart: text("actual_start").notNull().default(""),
++  actualEnd: text("actual_end").notNull().default(""),
++  isFixed: integer("is_fixed").notNull().default(0),
++  shareTime: integer("share_time").notNull().default(0),
++  note: text("note").notNull().default(""),
+   visibility: text("visibility").notNull().default("private"),
+   createdAt: integer("created_at").notNull(),
+ });
+diff --git a/drizzle/meta/_journal.json b/drizzle/meta/_journal.json
+index 67f99b6..02552e4 100644
+--- a/drizzle/meta/_journal.json
++++ b/drizzle/meta/_journal.json
+@@ -15,6 +15,13 @@
+       "when": 1793625212006,
+       "tag": "0001_loud_catseye",
+       "breakpoints": true
++    },
++    {
++      "idx": 2,
++      "version": "6",
++      "when": 1793668054840,
++      "tag": "0002_common_omega_red",
++      "breakpoints": true
+     }
+   ]
+ }
+\ No newline at end of file
+diff --git a/app/schedule-rules.ts b/app/schedule-rules.ts
+new file mode 100644
+--- /dev/null
++++ b/app/schedule-rules.ts
+@@ -0,0 +1,50 @@
++type RecordValue = Record<string, unknown>;
++const bands = ['anytime', 'morning', 'afternoon', 'night'];
++const text = (v: unknown) => typeof v === 'string' ? v.trim() : '';
++
++export function validDate(value: unknown): string {
++  const raw = text(value);
++  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return '';
++  const parsed = new Date(raw + 'T00:00:00Z');
++  return !Number.isNaN(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === raw ? raw : '';
++}
++
++// Merge before validating: partial updates must not leave an invalid time range.
++export function scheduleValues(data: RecordValue, current: RecordValue = {}) {
++  const readTime = (key: string, column: string) => {
++    const value = data[key] === undefined ? (current[column] ?? '') : data[key];
++    if (typeof value !== 'string' || (value !== '' && !/^([01]\d|2[0-3]):[0-5]\d$/.test(value))) {
++      throw new Error('시각은 00:00부터 23:59 사이로 입력해 주세요.');
++    }
++    return value;
++  };
++  const start = readTime('plannedStart', 'planned_start');
++  const end = readTime('plannedEnd', 'planned_end');
++  const actualStart = readTime('actualStart', 'actual_start');
++  const actualEnd = readTime('actualEnd', 'actual_end');
++  for (const [first, last] of [[start, end], [actualStart, actualEnd]]) {
++    if (last && !first) throw new Error('시작 시각을 함께 입력해 주세요.');
++    if (first && last && last <= first) throw new Error('종료 시각은 시작 시각보다 늦어야 해요. 자정을 넘는 일정은 나눠 주세요.');
++  }
++  for (const key of ['isFixed', 'shareTime']) {
++    if (data[key] !== undefined && typeof data[key] !== 'boolean') throw new Error('설정 값을 확인해 주세요.');
++  }
++  const fixed = data.isFixed === undefined ? !!current.is_fixed : data.isFixed;
++  const share = data.shareTime === undefined ? !!current.share_time : data.shareTime;
++  if (fixed && !start) throw new Error('시간이 정해진 약속에는 시작 시각이 필요해요.');
++  let band = data.timeBand === undefined ? (current.time_band ?? 'anytime') : data.timeBand;
++  if (typeof band !== 'string' || !bands.includes(band)) throw new Error('시간대를 확인해 주세요.');
++  if (start) band = start < '12:00' ? 'morning' : start < '18:00' ? 'afternoon' : 'night';
++  const note = data.note === undefined ? text(current.note) : text(data.note);
++  if (note.length > 1000) throw new Error('짧은 기록은 1000자까지 남길 수 있어요.');
++  return { time_band: band, planned_start: start, planned_end: end,
++    actual_start: actualStart, actual_end: actualEnd, is_fixed: fixed ? 1 : 0,
++    share_time: share ? 1 : 0, note };
++}
++
++export function sharedSchedule(task: RecordValue) {
++  if (task.share_time) return task;
++  // Privacy is enforced in the response, not merely by hiding UI elements.
++  return { ...task, time_band: 'anytime', planned_start: '', planned_end: '',
++    actual_start: '', actual_end: '', is_fixed: 0 };
++}
+diff --git a/drizzle/0002_common_omega_red.sql b/drizzle/0002_common_omega_red.sql
+new file mode 100644
+--- /dev/null
++++ b/drizzle/0002_common_omega_red.sql
+@@ -0,0 +1,8 @@
++ALTER TABLE `tasks` ADD `time_band` text DEFAULT 'anytime' NOT NULL;--> statement-breakpoint
++ALTER TABLE `tasks` ADD `planned_start` text DEFAULT '' NOT NULL;--> statement-breakpoint
++ALTER TABLE `tasks` ADD `planned_end` text DEFAULT '' NOT NULL;--> statement-breakpoint
++ALTER TABLE `tasks` ADD `actual_start` text DEFAULT '' NOT NULL;--> statement-breakpoint
++ALTER TABLE `tasks` ADD `actual_end` text DEFAULT '' NOT NULL;--> statement-breakpoint
++ALTER TABLE `tasks` ADD `is_fixed` integer DEFAULT 0 NOT NULL;--> statement-breakpoint
++ALTER TABLE `tasks` ADD `share_time` integer DEFAULT 0 NOT NULL;--> statement-breakpoint
++ALTER TABLE `tasks` ADD `note` text DEFAULT '' NOT NULL;
+\ No newline at end of file
+diff --git a/drizzle/meta/0002_snapshot.json b/drizzle/meta/0002_snapshot.json
+new file mode 100644
+--- /dev/null
++++ b/drizzle/meta/0002_snapshot.json
+@@ -0,0 +1,731 @@
++{
++  "version": "6",
++  "dialect": "sqlite",
++  "id": "75a9a4c1-eae9-425f-9c84-0f3e850c8bb6",
++  "prevId": "348bc47f-47c5-4738-abc8-d79a4baba149",
++  "tables": {
++    "accounts": {
++      "name": "accounts",
++      "columns": {
++        "user_id": {
++          "name": "user_id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "email": {
++          "name": "email",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "password_hash": {
++          "name": "password_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        }
++      },
++      "indexes": {
++        "accounts_email_unique": {
++          "name": "accounts_email_unique",
++          "columns": [
++            "email"
++          ],
++          "isUnique": true
++        }
++      },
++      "foreignKeys": {
++        "accounts_user_id_profiles_id_fk": {
++          "name": "accounts_user_id_profiles_id_fk",
++          "tableFrom": "accounts",
++          "tableTo": "profiles",
++          "columnsFrom": [
++            "user_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "auth_limits": {
++      "name": "auth_limits",
++      "columns": {
++        "key": {
++          "name": "key",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "window_start": {
++          "name": "window_start",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "count": {
++          "name": "count",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        }
++      },
++      "indexes": {},
++      "foreignKeys": {},
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "diaries": {
++      "name": "diaries",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "owner_id": {
++          "name": "owner_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "date": {
++          "name": "date",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "body": {
++          "name": "body",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "mood": {
++          "name": "mood",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "photo_key": {
++          "name": "photo_key",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "visibility": {
++          "name": "visibility",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "'private'"
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        }
++      },
++      "indexes": {},
++      "foreignKeys": {
++        "diaries_owner_id_profiles_id_fk": {
++          "name": "diaries_owner_id_profiles_id_fk",
++          "tableFrom": "diaries",
++          "tableTo": "profiles",
++          "columnsFrom": [
++            "owner_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "diary_comments": {
++      "name": "diary_comments",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "diary_id": {
++          "name": "diary_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "body": {
++          "name": "body",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        }
++      },
++      "indexes": {},
++      "foreignKeys": {
++        "diary_comments_diary_id_diaries_id_fk": {
++          "name": "diary_comments_diary_id_diaries_id_fk",
++          "tableFrom": "diary_comments",
++          "tableTo": "diaries",
++          "columnsFrom": [
++            "diary_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        },
++        "diary_comments_user_id_profiles_id_fk": {
++          "name": "diary_comments_user_id_profiles_id_fk",
++          "tableFrom": "diary_comments",
++          "tableTo": "profiles",
++          "columnsFrom": [
++            "user_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "diary_reactions": {
++      "name": "diary_reactions",
++      "columns": {
++        "diary_id": {
++          "name": "diary_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "emoji": {
++          "name": "emoji",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        }
++      },
++      "indexes": {},
++      "foreignKeys": {
++        "diary_reactions_diary_id_diaries_id_fk": {
++          "name": "diary_reactions_diary_id_diaries_id_fk",
++          "tableFrom": "diary_reactions",
++          "tableTo": "diaries",
++          "columnsFrom": [
++            "diary_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        },
++        "diary_reactions_user_id_profiles_id_fk": {
++          "name": "diary_reactions_user_id_profiles_id_fk",
++          "tableFrom": "diary_reactions",
++          "tableTo": "profiles",
++          "columnsFrom": [
++            "user_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {
++        "diary_reactions_diary_id_user_id_pk": {
++          "columns": [
++            "diary_id",
++            "user_id"
++          ],
++          "name": "diary_reactions_diary_id_user_id_pk"
++        }
++      },
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "habit_checks": {
++      "name": "habit_checks",
++      "columns": {
++        "habit_id": {
++          "name": "habit_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "date": {
++          "name": "date",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        }
++      },
++      "indexes": {},
++      "foreignKeys": {
++        "habit_checks_habit_id_habits_id_fk": {
++          "name": "habit_checks_habit_id_habits_id_fk",
++          "tableFrom": "habit_checks",
++          "tableTo": "habits",
++          "columnsFrom": [
++            "habit_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {
++        "habit_checks_habit_id_date_pk": {
++          "columns": [
++            "habit_id",
++            "date"
++          ],
++          "name": "habit_checks_habit_id_date_pk"
++        }
++      },
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "habits": {
++      "name": "habits",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "owner_id": {
++          "name": "owner_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "title": {
++          "name": "title",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "emoji": {
++          "name": "emoji",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "'🌱'"
++        },
++        "days": {
++          "name": "days",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "'0,1,2,3,4,5,6'"
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        }
++      },
++      "indexes": {},
++      "foreignKeys": {
++        "habits_owner_id_profiles_id_fk": {
++          "name": "habits_owner_id_profiles_id_fk",
++          "tableFrom": "habits",
++          "tableTo": "profiles",
++          "columnsFrom": [
++            "owner_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "profiles": {
++      "name": "profiles",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "name": {
++          "name": "name",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "theme": {
++          "name": "theme",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "'{}'"
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        }
++      },
++      "indexes": {},
++      "foreignKeys": {},
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "sessions": {
++      "name": "sessions",
++      "columns": {
++        "token_hash": {
++          "name": "token_hash",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "expires_at": {
++          "name": "expires_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        }
++      },
++      "indexes": {},
++      "foreignKeys": {
++        "sessions_user_id_profiles_id_fk": {
++          "name": "sessions_user_id_profiles_id_fk",
++          "tableFrom": "sessions",
++          "tableTo": "profiles",
++          "columnsFrom": [
++            "user_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "task_reactions": {
++      "name": "task_reactions",
++      "columns": {
++        "task_id": {
++          "name": "task_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "emoji": {
++          "name": "emoji",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        }
++      },
++      "indexes": {},
++      "foreignKeys": {
++        "task_reactions_task_id_tasks_id_fk": {
++          "name": "task_reactions_task_id_tasks_id_fk",
++          "tableFrom": "task_reactions",
++          "tableTo": "tasks",
++          "columnsFrom": [
++            "task_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        },
++        "task_reactions_user_id_profiles_id_fk": {
++          "name": "task_reactions_user_id_profiles_id_fk",
++          "tableFrom": "task_reactions",
++          "tableTo": "profiles",
++          "columnsFrom": [
++            "user_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {
++        "task_reactions_task_id_user_id_pk": {
++          "columns": [
++            "task_id",
++            "user_id"
++          ],
++          "name": "task_reactions_task_id_user_id_pk"
++        }
++      },
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "tasks": {
++      "name": "tasks",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "owner_id": {
++          "name": "owner_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "date": {
++          "name": "date",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "title": {
++          "name": "title",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "status": {
++          "name": "status",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "'todo'"
++        },
++        "time_band": {
++          "name": "time_band",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "'anytime'"
++        },
++        "planned_start": {
++          "name": "planned_start",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "''"
++        },
++        "planned_end": {
++          "name": "planned_end",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "''"
++        },
++        "actual_start": {
++          "name": "actual_start",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "''"
++        },
++        "actual_end": {
++          "name": "actual_end",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "''"
++        },
++        "is_fixed": {
++          "name": "is_fixed",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": 0
++        },
++        "share_time": {
++          "name": "share_time",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": 0
++        },
++        "note": {
++          "name": "note",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "''"
++        },
++        "visibility": {
++          "name": "visibility",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "'private'"
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        }
++      },
++      "indexes": {},
++      "foreignKeys": {
++        "tasks_owner_id_profiles_id_fk": {
++          "name": "tasks_owner_id_profiles_id_fk",
++          "tableFrom": "tasks",
++          "tableTo": "profiles",
++          "columnsFrom": [
++            "owner_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    }
++  },
++  "views": {},
++  "enums": {},
++  "_meta": {
++    "schemas": {},
++    "tables": {},
++    "columns": {}
++  },
++  "internal": {
++    "indexes": {}
++  }
++}
+\ No newline at end of file

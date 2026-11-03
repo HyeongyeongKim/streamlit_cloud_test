@@ -14,7 +14,7 @@ class StreamlitTests(unittest.TestCase):
         with patch.object(GardenClient, 'data', return_value=data):
             app.session_state['logged_in'] = True
             app.run()
-            for page in ['오늘 · 달력', '일기', '습관', '함께', '꾸미기', '계정']:
+            for page in ['오늘 · 일정', '내 기록', '일기', '습관', '함께', '화면 설정', '계정']:
                 app.sidebar.radio[0].set_value(page).run()
                 self.assertEqual(len(app.exception), 0, page)
             # Exercise populated owner/feed cards, including widget IDs.
@@ -25,8 +25,12 @@ class StreamlitTests(unittest.TestCase):
             data['sharedTasks'] = [dict(task, id='t2')]
             data['sharedDiaries'] = [dict(diary, id='d2')]
             data['habits'] = [{'id': 'h1', 'title': '물 마시기', 'days': '0,1,2,3,4,5,6'}]
-            for page in ['오늘 · 달력', '일기', '습관', '함께']:
+            data['capabilities'] = ['schedule-v1']
+            for page in ['오늘 · 일정', '내 기록', '일기', '습관', '함께']:
                 app.sidebar.radio[0].set_value(page).run()
+                if page == '오늘 · 일정':
+                    from datetime import date
+                    app.date_input(key='selected_date').set_value(date(2026, 11, 2)).run()
                 self.assertEqual(len(app.exception), 0, page)
 
 if __name__ == '__main__':

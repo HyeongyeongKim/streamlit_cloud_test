@@ -1,4 +1,6 @@
 sites/
+.backend/
+.artifacts/
 __pycache__/
 .pytest_cache/
 .streamlit/secrets.toml
