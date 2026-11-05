@@ -1,7 +1,5 @@
-sites/
-.backend/
-.artifacts/
 __pycache__/
-.pytest_cache/
+*.py[cod]
 .streamlit/secrets.toml
 .env
+sites/
